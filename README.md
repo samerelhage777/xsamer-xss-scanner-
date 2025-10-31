@@ -46,6 +46,9 @@ A powerful and customizable XSS vulnerability scanner written in Python. XSAMER 
 
 \### Quick Install
 
+
+cpoy and paste  all above  
+
 ```bash
 
 git clone https://github.com/yourusername/xsamer-xss-scanner.git
@@ -56,3 +59,29 @@ chmod +x install.sh
 
 ./install.sh
 
+chmod +x xsamer.py
+
+python xsamer.py
+
+ python xsamer.py
+
+██╗  ██╗███████╗ █████╗ ███╗   ███╗███████╗██████╗
+╚██╗██╔╝██╔════╝██╔══██╗████╗ ████║██╔════╝██╔══██╗
+ ╚███╔╝ ███████╗███████║██╔████╔██║█████╗  ██████╔╝
+ ██╔██╗ ╚════██║██╔══██║██║╚██╔╝██║██╔══╝  ██╔══██╗
+██╔╝ ██╗███████║██║  ██║██║ ╚═╝ ██║███████╗██║  ██║
+╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝
+
+   --------------   Welcome to XSAMER  BY Samer EL HAGE -----------
+👋 Welcome to XSS Scanner by Samer EL HAGE
+==================================================
+Usage: xsamer [OPTIONS]
+
+Quick Start:
+  xsamer -u https://example.com        # Scan single URL
+  xsamer -l urls.txt                   # Scan URLs from file
+  xsamer -u https://example.com -xss   # Use XSS Combo
+  xsamer -u https://example.com -v     # Verbose mode (shows status codes)
+  xsamer --show                        # Show all payloads
+
+Use 'xsamer -h' for full help
